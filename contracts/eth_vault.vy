@@ -23,6 +23,12 @@ struct ExactInputSingleParams:
     amountOutMinimum: uint256
     sqrtPriceLimitX96: uint160
 
+# Struct for deposit info return
+struct DepositInfo:
+    depositor: address
+    wsteth_amount: uint256
+    price_usd: uint256
+
 # Mainnet addresses
 PRICE_FEED_ETH_USD: constant(address) = 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419  # Chainlink ETH/USD
 PRICE_FEED_WSTETH_ETH: constant(address) = 0x524299aCeDB6d4A39b6b8D6E229dE7f644f12122  # Chainlink wstETH/ETH
@@ -34,7 +40,7 @@ MIN_DEPOSIT: constant(uint256) = 100000000000000000  # 0.1 ETH
 MAX_DEPOSIT: constant(uint256) = 100000000000000000000  # 100 ETH
 
 # Uniswap V3 pool fee (0.01% for ETH/wstETH pair)
-UNISWAP_FEE: constant(uint24) = 100  # Changed from 3000 (0.3%) to 100 (0.01%)
+UNISWAP_FEE: constant(uint24) = 100
 
 # Basis points denominator
 BPS_DENOMINATOR: constant(uint256) = 10000  # 100% = 10000 bps
@@ -52,6 +58,9 @@ MAX_ORACLE_AGE: constant(uint256) = 900  # 15 minutes
 # Maximum depositors per batch emergency withdrawal
 MAX_BATCH_SIZE: constant(uint256) = 50
 
+# Maximum deposits returned by get_all_deposits
+MAX_DEPOSITS_RETURN: constant(uint256) = 100
+
 # Multi-sig governance address
 admin: immutable(address)
 
@@ -63,6 +72,12 @@ deposit_prices: public(HashMap[address, uint256])
 
 # Mapping to track active depositors
 is_depositor: public(HashMap[address, bool])
+
+# Array to store depositor addresses
+depositors: public(address[MAX_DEPOSITORS])
+
+# Number of active depositors
+depositor_count: public(uint256)
 
 # Event for deposits
 event Deposit:
@@ -88,6 +103,27 @@ event EmergencyWithdraw:
     initiated_by: indexed(address)
 
 @external
+@view
+def get_all_deposits() -> DynArray[DepositInfo, MAX_DEPOSITS_RETURN]:
+    """
+    Returns a list of all active depositors with their balances and price levels.
+    @return An array of DepositInfo structs (depositor, wsteth_amount, price_usd).
+    """
+    deposits: DynArray[DepositInfo, MAX_DEPOSITS_RETURN] = []
+    for i in range(MAX_DEPOSITORS):
+        if i >= self.depositor_count:
+            break
+        depositor: address = self.depositors[i]
+        if depositor == empty(address) or self.balances[depositor] == 0:
+            continue
+        deposits.append(DepositInfo({
+            depositor: depositor,
+            wsteth_amount: self.balances[depositor],
+            price_usd: self.deposit_prices[depositor]
+        }))
+    return deposits
+
+@external
 def __init__(admin_addr: address):
     admin = admin_addr
 
@@ -107,6 +143,7 @@ def deposit(price_usd: uint256, slippage_bps: uint256, tip_bps: uint256):
     assert slippage_bps <= MAX_SLIPPAGE_BPS, "Slippage too high"
     assert tip_bps <= MAX_TIP_BPS, "Tip too high"
     assert self.balances[msg.sender] == 0, "Existing deposit must be withdrawn first"
+    assert self.depositor_count < MAX_DEPOSITORS, "Too many depositors"
 
     # Calculate and send tip
     tip_amount: uint256 = (msg.value * tip_bps) / BPS_DENOMINATOR
@@ -141,48 +178,49 @@ def deposit(price_usd: uint256, slippage_bps: uint256, tip_bps: uint256):
     })
     wsteth_received: uint256 = router.exactInputSingle(params)
 
-    # Store wstETH balance, price, and mark as depositor
+    # Store wstETH balance and price
     self.balances[msg.sender] = wsteth_received
     self.deposit_prices[msg.sender] = price_usd
     self.is_depositor[msg.sender] = True
+    self.depositors[self.depositor_count] = msg.sender
+    self.depositor_count += 1
 
     log Deposit(msg.sender, msg.value, wsteth_received, price_usd, slippage_bps, tip_bps, tip_amount)
 
 @external
 def withdraw():
     """
-    Swaps wstETH to ETH with default 1% slippage if ETH/USD price exceeds deposit price and data is fresh.
+    Swaps wstETH back to ETH via Uniswap V3 with default slippage (1%) if oracle price exceeds deposit price and data is fresh.
     """
     assert self.balances[msg.sender] > 0, "No balance to withdraw"
 
-    # Check ETH/USD oracle
-    oracle_eth: AggregatorV3Interface = AggregatorV3Interface(PRICE_FEED_ETH_USD)
-    (round_id_e, answer_e, started_at_e, updated_at_e, answered_in_round_e) = oracle_eth.latestRoundData()
-    assert answer_e > 0, "Invalid ETH/USD price"
-    assert block.timestamp <= updated_at_e + MAX_ORACLE_AGE, "ETH/USD oracle too old"
-    current_price: uint256 = convert(answer_e, uint256)
+    # Check Chainlink oracle price and freshness
+    oracle: AggregatorV3Interface = AggregatorV3Interface(PRICE_FEED_ETH_USD)
+    (round_id, answer, started_at, updated_at, answered_in_round) = oracle.latestRoundData()
+    assert answer > 0, "Invalid oracle price"
+    assert block.timestamp <= updated_at + MAX_ORACLE_AGE, "Oracle data too old"
+    current_price: uint256 = convert(answer, uint256)
     assert current_price > self.deposit_prices[msg.sender], "Oracle price too low"
 
-    # Default slippage
+    # Use default slippage of 1% (100 bps)
     slippage_bps: uint256 = 100
     self._withdraw_with_slippage(slippage_bps)
 
 @external
 def withdraw_with_slippage(slippage_bps: uint256):
     """
-    Swaps wstETH to ETH with user-specified slippage if ETH/USD price exceeds deposit price and data is fresh.
+    Swaps wstETH back to ETH via Uniswap V3 with user-specified slippage if oracle price exceeds deposit price and data is fresh.
     @param slippage_bps Slippage tolerance in basis points (e.g., 100 = 1%).
     """
     assert self.balances[msg.sender] > 0, "No balance to withdraw"
-    assert slippage_bps >= MIN_SLIPPAGE_BPS, "Slippage too low"
     assert slippage_bps <= MAX_SLIPPAGE_BPS, "Slippage too high"
 
-    # Check ETH/USD oracle
-    oracle_eth: AggregatorV3Interface = AggregatorV3Interface(PRICE_FEED_ETH_USD)
-    (round_id_e, answer_e, started_at_e, updated_at_e, answered_in_round_e) = oracle_eth.latestRoundData()
-    assert answer_e > 0, "Invalid ETH/USD price"
-    assert block.timestamp <= updated_at_e + MAX_ORACLE_AGE, "ETH/USD oracle too old"
-    current_price: uint256 = convert(answer_e, uint256)
+    # Check Chainlink oracle price and freshness
+    oracle: AggregatorV3Interface = AggregatorV3Interface(PRICE_FEED_ETH_USD)
+    (round_id, answer, started_at, updated_at, answered_in_round) = oracle.latestRoundData()
+    assert answer > 0, "Invalid oracle price"
+    assert block.timestamp <= updated_at + MAX_ORACLE_AGE, "Oracle data too old"
+    current_price: uint256 = convert(answer, uint256)
     assert current_price > self.deposit_prices[msg.sender], "Oracle price too low"
 
     self._withdraw_with_slippage(slippage_bps)
@@ -192,24 +230,17 @@ def _withdraw_with_slippage(slippage_bps: uint256):
     """
     Internal function to perform wstETH to ETH swap with specified slippage.
     """
+    # Prepare to swap wstETH to ETH
     wsteth_amount: uint256 = self.balances[msg.sender]
     self.balances[msg.sender] = 0
     self.deposit_prices[msg.sender] = 0
     self.is_depositor[msg.sender] = False
 
-    # Check wstETH/ETH oracle for slippage
-    oracle_wsteth: AggregatorV3Interface = AggregatorV3Interface(PRICE_FEED_WSTETH_ETH)
-    (round_id_w, answer_w, started_at_w, updated_at_w, answered_in_round_w) = oracle_wsteth.latestRoundData()
-    assert answer_w > 0, "Invalid wstETH/ETH price"
-    assert block.timestamp <= updated_at_w + MAX_ORACLE_AGE, "wstETH/ETH oracle too old"
-    wsteth_per_eth: uint256 = convert(answer_w, uint256)  # wstETH per ETH, scaled by 10**18
-
-    # Estimate minimum ETH output
-    eth_per_wsteth: uint256 = (10**36) / wsteth_per_eth  # ETH per wstETH, scaled by 10**18
-    min_eth_out: uint256 = (wsteth_amount * eth_per_wsteth) / 10**18
+    # Estimate minimum ETH output (wstETH * 1.2, apply slippage)
+    min_eth_out: uint256 = (wsteth_amount * WSTETH_TO_ETH_RATIO) / 10**18
     min_eth_out = min_eth_out * (BPS_DENOMINATOR - slippage_bps) / BPS_DENOMINATOR
 
-    # Approve Uniswap router
+    # Approve Uniswap router to spend wstETH
     raw_call(
         WSTETH,
         method_id("approve(address,uint256)", bytes[4]) +
@@ -222,13 +253,13 @@ def _withdraw_with_slippage(slippage_bps: uint256):
     router: UniswapV3Router = UniswapV3Router(UNISWAP_ROUTER)
     params: ExactInputSingleParams = ExactInputSingleParams({
         tokenIn: WSTETH,
-        tokenOut: empty(address),
+        tokenOut: empty(address),  # ETH (address(0) for native ETH)
         fee: UNISWAP_FEE,
-        recipient: msg.sender,
-        deadline: block.timestamp + 15,
+        recipient: msg.sender,  # Send ETH directly to user
+        deadline: block.timestamp + 15,  # 15 seconds deadline
         amountIn: wsteth_amount,
-        amountOutMinimum: min_eth_out,
-        sqrtPriceLimitX96: 0
+        amountOutMinimum: min_eth_out,  # User-specified slippage
+        sqrtPriceLimitX96: 0  # No price limit
     })
     eth_received: uint256 = router.exactInputSingle(params)
 
@@ -237,10 +268,10 @@ def _withdraw_with_slippage(slippage_bps: uint256):
 @external
 def emergency_withdraw(depositor: address):
     """
-    Allows the admin to return wstETH to a specific depositor without swapping.
+    Allows the contract creator to return wstETH to a specific depositor without swapping.
     @param depositor The address to withdraw wstETH for.
     """
-    assert msg.sender == admin, "Only admin can call"
+    assert msg.sender == admin, "Only creator can call"
     assert self.is_depositor[depositor], "Not a depositor"
     assert self.balances[depositor] > 0, "No balance"
 
@@ -249,16 +280,17 @@ def emergency_withdraw(depositor: address):
     self.deposit_prices[depositor] = 0
     self.is_depositor[depositor] = False
 
+    # Transfer wstETH
     ERC20(WSTETH).transfer(depositor, wsteth_amount)
     log EmergencyWithdraw(depositor, wsteth_amount, msg.sender)
 
 @external
 def emergency_withdraw_batch(depositors: address[MAX_BATCH_SIZE]):
     """
-    Allows the admin to return wstETH to multiple depositors without swapping.
+    Allows the contract creator to return wstETH to multiple depositors without swapping.
     @param depositors Array of depositor addresses (up to MAX_BATCH_SIZE).
     """
-    assert msg.sender == admin, "Only admin can call"
+    assert msg.sender == admin, "Only creator can call"
 
     for i in range(MAX_BATCH_SIZE):
         depositor: address = depositors[i]
